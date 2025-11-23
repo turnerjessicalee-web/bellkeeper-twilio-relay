@@ -1,11 +1,16 @@
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
+import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 10000;
 
 // These will come from Render
-const ELEVEN_WS_URL = process.env.ELEVEN_WS_URL; 
+const ELEVEN_WS_URL = process.env.ELEVEN_WS_URL;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+
+// New: Supabase transcript ingest URL
+const SUPABASE_TRANSCRIPT_INGEST_URL =
+  process.env.SUPABASE_TRANSCRIPT_INGEST_URL;
 
 if (!ELEVEN_WS_URL || !ELEVEN_API_KEY) {
   console.error("Missing ELEVEN_WS_URL or ELEVEN_API_KEY env vars");
@@ -17,7 +22,6 @@ const server = http.createServer((req, res) => {
     res.end("BellKeeper Twilio relay is running\n");
     return;
   }
-
   res.writeHead(404);
   res.end();
 });
@@ -37,10 +41,13 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWs) => {
   console.log("Twilio WebSocket connected");
 
+  // Track callSid from Twilio "start" event
+  let callSid = null;
+
   const elevenWs = new WebSocket(ELEVEN_WS_URL, {
     headers: {
-      "xi-api-key": ELEVEN_API_KEY
-    }
+      "xi-api-key": ELEVEN_API_KEY,
+    },
   });
 
   elevenWs.on("open", () => {
@@ -58,18 +65,48 @@ wss.on("connection", (twilioWs) => {
     }
   });
 
-  // Twilio → ElevenLabs
+  // Twilio → ElevenLabs (+ send transcript stub to Supabase)
   twilioWs.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
 
-      if (msg.event === "media" && msg.media?.payload && elevenWs.readyState === WebSocket.OPEN) {
-        // TODO: we may need to tweak this for ElevenLabs, but structure is fine
+      // Save callSid when stream starts
+      if (msg.event === "start") {
+        callSid = msg.start?.callSid || msg.start?.streamSid || null;
+        console.log("Media stream started for callSid:", callSid);
+        return;
+      }
+
+      if (
+        msg.event === "media" &&
+        msg.media?.payload &&
+        elevenWs.readyState === WebSocket.OPEN
+      ) {
+        // Forward audio to ElevenLabs (existing behaviour)
         elevenWs.send(
           JSON.stringify({
-            audio: msg.media.payload
+            audio: msg.media.payload,
           })
         );
+
+        // Also send a placeholder transcript line to Supabase
+        if (SUPABASE_TRANSCRIPT_INGEST_URL) {
+          fetch(SUPABASE_TRANSCRIPT_INGEST_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              callSid: callSid || msg.streamSid || "unknown",
+              text: "[audio chunk]", // TODO: replace with real STT later
+              speaker: "user",
+            }),
+          }).catch((err) => {
+            console.error("Error posting transcript to Supabase:", err);
+          });
+        } else {
+          console.warn(
+            "SUPABASE_TRANSCRIPT_INGEST_URL not set, skipping transcript POST"
+          );
+        }
       }
     } catch (err) {
       console.error("Error handling Twilio message:", err);
@@ -94,14 +131,13 @@ wss.on("connection", (twilioWs) => {
   elevenWs.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
-
       if (msg.audio && twilioWs.readyState === WebSocket.OPEN) {
         twilioWs.send(
           JSON.stringify({
             event: "media",
             media: {
-              payload: msg.audio
-            }
+              payload: msg.audio,
+            },
           })
         );
       }
