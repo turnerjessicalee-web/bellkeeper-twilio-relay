@@ -1,6 +1,6 @@
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-import fetch from "node-fetch";
+
 
 const PORT = process.env.PORT || 10000;
 
